@@ -5,67 +5,63 @@ import random
 import numpy as np
 import math
 from scipy import stats # for Exponential Mechanism
-import os
 import multiprocessing as multi
 
-NO_NOISE = False # for making random trees without any privacy parameters
-SMOOTH_SENSITIVITY = True # not used by JAG
-DISJOINT_DATA = False # FALSE = Kellaris13 samples. Each tree gets a subset of the dataset, and the full epsilon budget.
-JAG = False # Jagannathan's DP RDT. assumes NOT smooth_sensitivity and NOT disjoint data
-MULTI_THREAD = False
+import node
+
+MULTI_THREAD = False # Turn this on if you would like to use multi-threading. Warning: if each tree builds too quickly, overhead time will be relatively large.
 
 class DP_RDT_2016:    
-    ''' Make a forest of Random Trees, then filter the training data through each tree to fill the leafs. '''
-    def __init__(self, attribute_indexes, attribute_domains, categs, num_trees, max_depth, epsilon, class_values, train, test):
-        self._attribute_domains = attribute_domains
+    ''' Make a forest of Random Trees, then filter the training data through each tree to fill the leafs. 
+    IMPORTANT: the first attribute of both the training and testing data MUST be the class attribute. '''
+    def __init__(self, categs, # the indexes of the categorical (i.e. discrete) attributes
+                 num_trees, # the number of trees to build
+                 epsilon, # the total privacy budget
+                 train, # 2D list of the training data where the columns are the attributes, and the first column is the class attribute
+                 test): # 2D list of the testing data where the columns are the attributes, and the first column is the class attribute
+        ''' Some initialization '''
         self._categs = categs
+        numers = [x for x in train[0][1:] if x not in categs] # the indexes of the numerical (i.e. continuous) attributes
+        self._attribute_domains = get_attr_domains(train, numers, categs)
+        attribute_indexes = [int(k) for k,v in self._attribute_domains.items()]
+        self._max_depth = calc_tree_depth(len(numers), len(categs))
         self._num_trees = num_trees
-        self._max_depth = max_depth
+
+        ''' Some bonus information gained throughout the algorithm '''
         self._missed_records = []
         self._flipped_majorities = []
         self._av_sensitivity = []
         self._empty_leafs = []
 
         random.shuffle(train)
-        class_labels = [int(x) for x in class_values]
-        actual_labels = [int(x[0]) for x in test]
-        voted_labels = [defaultdict(int) for x in test]
+        class_labels = list(set([int(x[0]) for x in train])) # domain of labels
+        actual_labels = [int(x[0]) for x in test] # ordered list of the test data labels
+        voted_labels = [defaultdict(int) for x in test] # initialize
         
-        ''' SELECT THE NUMBER OF CORES TO USE '''
         if MULTI_THREAD:        
+            ''' PERSONALIZE THE NUMBER OF CORES TO USE '''
             num_threads = multi.cpu_count() - 2
             pool = multi.Pool(processes = num_threads)
             processes = []
 
         subset_size = int(len(train)/self._num_trees) # if using subsets, we don't need to divide the epsilon budget
-        curr_tree = 0
+        #curr_tree = 0
         for i in range(self._num_trees):
             if MULTI_THREAD:
-                if DISJOINT_DATA: 
-                    processes.append(pool.apply_async(self.build_tree, (attribute_indexes, train[i*subset_size:(i+1)*subset_size], epsilon, class_values, test)))
-                else:
-                    #processes.append(pool.apply_async(self.build_tree, (attribute_indexes, train, epsilon/float(self._num_trees), class_values, test)))
-                    ''' random sub-samples using Kellaris13 '''
-                    new_train = random.sample(train, subset_size)
-                    p = 1./float(self._num_trees) # P CAN BE ANY USER-DEFINED NUMBER BETWEEN 0 AND 1
-                    new_epsilon = math.log( 1 + (math.exp(epsilon/float(self._num_trees))-1.) / p)
-                    processes.append(pool.apply_async(self.build_tree, (attribute_indexes, new_train, new_epsilon, class_values, test)))
-            else: # not multi-threaded
-                if DISJOINT_DATA: 
-                    results = self.build_tree(attribute_indexes, train[i*subset_size:(i+1)*subset_size], epsilon, class_values, test)
-                else:
-                    results = self.build_tree(attribute_indexes, train, epsilon/float(self._num_trees), class_values, test)
+                processes.append(pool.apply_async(self.build_tree, (attribute_indexes, train[i*subset_size:(i+1)*subset_size], epsilon, class_labels, test)))
+            else:
+                results = self.build_tree(attribute_indexes, train[i*subset_size:(i+1)*subset_size], epsilon, class_labels, test)
 
                 curr_votes = results['voted_labels']
                 for rec_index in range(len(test)):
                     for lab in class_labels:
-                        voted_labels[rec_index][lab] += curr_votes[rec_index][lab]
+                        voted_labels[rec_index][str(lab)] += curr_votes[rec_index][str(lab)]
                 self._missed_records.append(results['missed_records'])
                 self._flipped_majorities.append(results['flipped_majorities'])
                 self._av_sensitivity.append(results['av_sensitivity'])
                 self._empty_leafs.append(results['empty_leafs'])
-                curr_tree += 1
-                if curr_tree >= self._num_trees: break
+                #curr_tree += 1
+                #if curr_tree >= self._num_trees: break
 
         if MULTI_THREAD:        
             for i in range(self._num_trees):
@@ -73,7 +69,7 @@ class DP_RDT_2016:
                 curr_votes = processes[i].get()['voted_labels']
                 for rec_index in range(len(test)):
                     for lab in class_labels:
-                        voted_labels[rec_index][lab] += curr_votes[rec_index][lab]
+                        voted_labels[rec_index][str(lab)] += curr_votes[rec_index][str(lab)]
                 self._missed_records.append(processes[i].get()['missed_records'])
                 self._flipped_majorities.append(processes[i].get()['flipped_majorities'])
                 self._av_sensitivity.append(processes[i].get()['av_sensitivity'])
@@ -86,12 +82,38 @@ class DP_RDT_2016:
         counts = Counter([x == y for x, y in zip(final_predictions, actual_labels)])
         self._predicted_labels = final_predictions
         self._accuracy = float(counts[True]) / len(test)
-        
+
+
+    def get_attr_domains(self, data, numers, categs):
+        attr_domains = {}
+        transData = np.transpose(data)
+        for i in categs:
+            attr_domains[str(i)] = [str(x) for x in set(transData[i])]
+            print("original domain length of categ att {}: {}".format(i, len(attr_domains[str(i)])))
+        for i in numers:
+            vals = [float(x) for x in transData[i]]
+            attr_domains[str(i)] = [min(vals), max(vals)]
+        return attr_domains
+
+    def calc_tree_depth(self, num_numers, num_categs):
+        if num_numers<1: # if no numerical attributes
+            return math.floor(num_categs/2.) # depth = half the number of categorical attributes
+        else:
+            ''' Designed using balls-in-bins probability. See the paper for details. '''
+            m = float(num_numers)
+            depth = 0
+            expected_empty = m # the number of unique attributes not selected so far
+            while expected_empty > m/2.: # repeat until we have less than half the attributes being empty
+                expected_empty = m * ((m-1.)/m)**depth
+                depth += 1
+            final_depth = math.floor(depth + (num_categs/2.)) # the above was only for half the numerical attributes. now add half the categorical attributes
+            ''' WARNING: The depth translates to an exponential increase in memory usage. Do not go above ~15 unless you have 50+ GB of RAM. '''
+            return min(15, final_depth) 
     
-    def build_tree(self, attribute_indexes, train, epsilon, class_values, test):
+    def build_tree(self, attribute_indexes, train, epsilon, class_labels, test):
         root = random.choice(attribute_indexes)
         tree = Tree(attribute_indexes, root, self)
-        tree.filter_training_data_and_count(train, epsilon, class_values)
+        tree.filter_training_data_and_count(train, epsilon, class_labels)
         missed_records = tree._missed_records
         flipped_majorities = tree._flip_fraction
         av_sensitivity = tree._av_sensitivity
@@ -174,7 +196,7 @@ class Tree(DP_RDT_2016):
     
     def filter_record(self, record, node, class_index=0):
         if not node:
-            return 0.00001 # doesn't happen in my experience
+            return 0.00001 # For debugging purposes. Doesn't happen in my experience
         if not node._children: # if leaf
             node.increment_class_count(record[class_index])
             return 0.
@@ -197,9 +219,9 @@ class Tree(DP_RDT_2016):
                         break
             if child is None and node._splitting_attribute in self._categs: # if the record's value couldn't be found:
                 #print(str([i._split_value_from_parent,])+" vs "+str([record[node._splitting_attribute],])+" out of "+str(len(node._children)))
-                return 1.
+                return 1. # For debugging purposes
             elif child is None: # if the record's value couldn't be found:
-                return 0.001
+                return 0.001 # For debugging purposes
             return self.filter_record(record, child, class_index)
 
     def set_all_noisy_majorities(self, epsilon, node, class_values, flipped_majorities, empty_leafs, sensitivities):

@@ -22,6 +22,9 @@
     <EnableUnmanagedDebugging>false</EnableUnmanagedDebugging>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="node.py">
+      <SubType>Code</SubType>
+    </Compile>
     <Compile Include="Smooth_Random_Trees.py" />
   </ItemGroup>
   <PropertyGroup>

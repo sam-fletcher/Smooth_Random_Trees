@@ -1,5 +1,11 @@
 ''' A class defining the nodes in our Differentially Private Random Decision Forest '''
 
+from collections import defaultdict
+import random
+import numpy as np
+import math
+from scipy import stats # for Exponential Mechanism
+
 class node:
     def __init__(self, parent_node, split_value_from_parent, splitting_attribute, tree_level, id, children, svfp_numer=None):
         self._parent_node = parent_node

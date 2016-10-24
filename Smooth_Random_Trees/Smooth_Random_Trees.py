@@ -4,27 +4,28 @@ from collections import Counter, defaultdict
 import random
 import numpy as np
 import math
-from scipy import stats # for Exponential Mechanism
 import multiprocessing as multi
 
 import node
 
 MULTI_THREAD = False # Turn this on if you would like to use multi-threading. Warning: if each tree builds too quickly, overhead time will be relatively large.
 
-class DP_RDT_2016:    
+class DP_Random_Forest:    
     ''' Make a forest of Random Trees, then filter the training data through each tree to fill the leafs. 
     IMPORTANT: the first attribute of both the training and testing data MUST be the class attribute. '''
-    def __init__(self, categs, # the indexes of the categorical (i.e. discrete) attributes
-                 num_trees, # the number of trees to build
-                 epsilon, # the total privacy budget
-                 train, # 2D list of the training data where the columns are the attributes, and the first column is the class attribute
-                 test): # 2D list of the testing data where the columns are the attributes, and the first column is the class attribute
+    def __init__(self, 
+                train, # 2D list of the training data where the columns are the attributes, and the first column is the class attribute
+                test, # 2D list of the testing data where the columns are the attributes, and the first column is the class attribute
+                categs, # the indexes of the categorical (i.e. discrete) attributes, EXCLUDING the class attribute
+                num_trees, # the number of trees to build. Since we divide the data among the trees, ensure: num_trees << len(train)
+                epsilon, # the total privacy budget. The whole budget will be used in each tree (and thus each leaf), due to using disjoint data.
+                ):
         ''' Some initialization '''
         self._categs = categs
-        numers = [x for x in train[0][1:] if x not in categs] # the indexes of the numerical (i.e. continuous) attributes
-        self._attribute_domains = get_attr_domains(train, numers, categs)
+        numers = [x+1 for x in range(len(train[0])-1) if x+1 not in categs] # the indexes of the numerical (i.e. continuous) attributes
+        self._attribute_domains = self.get_attr_domains(train, numers, categs)
         attribute_indexes = [int(k) for k,v in self._attribute_domains.items()]
-        self._max_depth = calc_tree_depth(len(numers), len(categs))
+        self._max_depth = self.calc_tree_depth(len(numers), len(categs))
         self._num_trees = num_trees
 
         ''' Some bonus information gained throughout the algorithm '''
@@ -44,7 +45,7 @@ class DP_RDT_2016:
             pool = multi.Pool(processes = num_threads)
             processes = []
 
-        subset_size = int(len(train)/self._num_trees) # if using subsets, we don't need to divide the epsilon budget
+        subset_size = int(len(train)/self._num_trees) # by using subsets, we don't need to divide the epsilon budget
         #curr_tree = 0
         for i in range(self._num_trees):
             if MULTI_THREAD:
@@ -52,10 +53,11 @@ class DP_RDT_2016:
             else:
                 results = self.build_tree(attribute_indexes, train[i*subset_size:(i+1)*subset_size], epsilon, class_labels, test)
 
+                ''' Collect the predictions and the bonus information '''
                 curr_votes = results['voted_labels']
                 for rec_index in range(len(test)):
                     for lab in class_labels:
-                        voted_labels[rec_index][str(lab)] += curr_votes[rec_index][str(lab)]
+                        voted_labels[rec_index][lab] += curr_votes[rec_index][lab]
                 self._missed_records.append(results['missed_records'])
                 self._flipped_majorities.append(results['flipped_majorities'])
                 self._av_sensitivity.append(results['av_sensitivity'])
@@ -79,6 +81,8 @@ class DP_RDT_2016:
         final_predictions = []
         for i,rec in enumerate(test):
             final_predictions.append( Counter(voted_labels[i]).most_common(1)[0][0] )
+        print(final_predictions)
+        print(actual_labels)
         counts = Counter([x == y for x, y in zip(final_predictions, actual_labels)])
         self._predicted_labels = final_predictions
         self._accuracy = float(counts[True]) / len(test)
@@ -127,7 +131,7 @@ class DP_RDT_2016:
                 'av_sensitivity':av_sensitivity, 'empty_leafs':empty_leafs}
 
 
-class Tree(DP_RDT_2016):
+class Tree(DP_Random_Forest):
     ''' Set the root for this tree and then start the random-tree-building process. '''
     def __init__(self, attribute_indexes, root_attribute, pc):
         self._id = 0
@@ -135,7 +139,7 @@ class Tree(DP_RDT_2016):
         self._max_depth = pc._max_depth
         self._num_leafs = 0
 
-        root = node(None, None, root_attribute, 1, 0, []) # the root node is level 1
+        root = node.node(None, None, root_attribute, 1, 0, []) # the root node is level 1
         attribute_domains = pc._attribute_domains
         
         if root_attribute not in self._categs: # numerical attribute
@@ -154,10 +158,10 @@ class Tree(DP_RDT_2016):
         self._id += 1
         if not candidate_atts or current_depth >= self._max_depth+1: # termination conditions. leaf nodes don't count to the depth.
             self._num_leafs += 1
-            return node(parent_node, splitting_value_from_parent, None, current_depth, self._id, None, svfp_numer=svfp_numer) 
+            return node.node(parent_node, splitting_value_from_parent, None, current_depth, self._id, None, svfp_numer=svfp_numer) 
         else:
             new_splitting_attr = random.choice(candidate_atts) # pick the attribute that this node will split on
-            current_node = node(parent_node, splitting_value_from_parent, new_splitting_attr, current_depth, self._id, [], svfp_numer=svfp_numer) # make a new node
+            current_node = node.node(parent_node, splitting_value_from_parent, new_splitting_attr, current_depth, self._id, [], svfp_numer=svfp_numer) # make a new node
 
             if new_splitting_attr not in self._categs: # numerical attribute
                 split_val = random.uniform(attribute_domains[str(new_splitting_attr)][0], attribute_domains[str(new_splitting_attr)][1])
@@ -263,3 +267,18 @@ class Tree(DP_RDT_2016):
                 return node._noisy_majority #majority_value, majority_fraction
 
             return self.classify(child, record)
+
+
+''' A toy example of how to call the class '''
+#if __name__ == '__main__':
+#    data = [
+#        [1,'a',12,3,14],
+#        [1,'a',12,3,4],
+#        [1,'a',12,3,4],
+#        [0,'a',2,13,4],
+#        [0,'b',2,13,14],
+#        [0,'b',2,3,14],
+#        ]
+
+#    forest = DP_Random_Forest(data[1:], data, [1,], 2, 0.1)
+#    print('accuracy = '+str(forest._accuracy))

@@ -1,4 +1,6 @@
-''' A class that builds Differentially Private Random Decision Trees, using Smooth Sensitivity '''
+''' A class that builds Differentially Private Random Decision Trees, using Smooth Sensitivity 
+    by Sam Fletcher
+    www.samfletcher.work '''
 
 from collections import Counter, defaultdict
 import random
@@ -6,7 +8,7 @@ import numpy as np
 import math
 import multiprocessing as multi
 
-import node
+import node # local module
 
 MULTI_THREAD = False # Turn this on if you would like to use multi-threading. Warning: if each tree builds too quickly, overhead time will be relatively large.
 
@@ -46,7 +48,6 @@ class DP_Random_Forest:
             processes = []
 
         subset_size = int(len(train)/self._num_trees) # by using subsets, we don't need to divide the epsilon budget
-        #curr_tree = 0
         for i in range(self._num_trees):
             if MULTI_THREAD:
                 processes.append(pool.apply_async(self.build_tree, (attribute_indexes, train[i*subset_size:(i+1)*subset_size], epsilon, class_labels, test)))
@@ -62,8 +63,6 @@ class DP_Random_Forest:
                 self._flipped_majorities.append(results['flipped_majorities'])
                 self._av_sensitivity.append(results['av_sensitivity'])
                 self._empty_leafs.append(results['empty_leafs'])
-                #curr_tree += 1
-                #if curr_tree >= self._num_trees: break
 
         if MULTI_THREAD:        
             for i in range(self._num_trees):
